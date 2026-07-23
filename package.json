@@ -1,0 +1,53 @@
+{
+  "name": "sort-large-csv",
+  "version": "1.0.0",
+  "description": "External merge sort for CSVs larger than memory — sorts by column, optional split-by-value output, and global exact-row dedup.",
+  "keywords": [
+    "csv",
+    "sort",
+    "external-sort",
+    "merge-sort",
+    "dedup",
+    "dedupe",
+    "large-files",
+    "big-data",
+    "cli"
+  ],
+  "bin": {
+    "sort-large-csv": "index.js"
+  },
+  "main": "index.js",
+  "type": "commonjs",
+  "files": [
+    "index.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "author": "Dan Gaidula <dan@iceboxind.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dgaidula/sort-large-csv.git"
+  },
+  "homepage": "https://github.com/dgaidula/sort-large-csv#readme",
+  "bugs": {
+    "url": "https://github.com/dgaidula/sort-large-csv/issues"
+  },
+  "dependencies": {
+    "cli-progress": "^3.12.0",
+    "csv-parser": "^3.2.1",
+    "fast-csv": "^5.0.7",
+    "fs-extra": "^11.3.5",
+    "yargs": "^17.7.3"
+  }
+}

@@ -1,0 +1,14 @@
+# Node
+node_modules/
+npm-debug.log*
+.npm/
+
+# This tool's own working files — never commit real/client data or generated output
+temp_chunks/
+duplicates_log.csv
+sorted_output.csv
+output_*.csv
+
+# Editor / OS
+.DS_Store
+*.swp
