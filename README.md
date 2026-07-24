@@ -13,7 +13,7 @@ npx sort-large-csv --help
 
 Or install it: `npm i -g sort-large-csv`, then run `sort-large-csv ...`.
 
-## What it's good for
+## What it’s good for
 
 Sorting or splitting CSVs that are too big to load into memory or to sort
 with a spreadsheet app — export dumps, list-merges, dedup passes on files
@@ -32,7 +32,7 @@ stream per chunk.
    fails).
 
 Sort comparison is numeric-aware: if both values in the sort column parse as
-numbers, they're compared numerically; otherwise it falls back to a string
+numbers, they’re compared numerically; otherwise it falls back to a string
 locale compare. Column headers are matched case-insensitively (trimmed and
 lowercased), so `--column Email` matches an `Email`, `EMAIL`, or ` email `
 header.
@@ -54,7 +54,7 @@ header.
 ## Dedup behavior
 
 `--dedupe` removes **exact-duplicate rows** — every column value must match.
-It's a *global* dedup: every row is checked against every row seen so far in
+It’s a *global* dedup: every row is checked against every row seen so far in
 the entire file, not just the row immediately before it, so duplicates are
 caught regardless of where they land after sorting (e.g. two identical rows
 that sort into different, non-adjacent chunks). Distinct rows are never
@@ -82,12 +82,27 @@ Splits `orders.csv` into one file per distinct `region` value, written into
 
 ## Notes
 
-- Temporary chunk files are written to a `temp_chunks/` directory alongside
-  the script and removed automatically when the run finishes (or errors
-  out). Don't run two instances against the same install concurrently.
+- Temporary chunk files are written to a unique, per-run directory under the
+  OS temp root (via `os.tmpdir()`) and removed automatically when the run
+  finishes (or errors out, or the process is interrupted). Safe to run
+  multiple instances concurrently — each gets its own temp directory.
 - In split mode, output filenames are derived from the column value with
   non-alphanumeric characters replaced by `_` (e.g. `New York` →
   `output_new_york.csv`).
+
+## Limitations
+
+- **`--dedupe` memory use is unbounded.** It keeps a `Set` of one signature
+  string per *unique* row seen so far, held in memory for the whole merge
+  phase — chunking and sorting stay disk-bounded, but dedup does not. On a
+  file with a huge number of distinct rows, this can use a lot of memory even
+  though the rest of the tool is designed to run in bounded memory.
+- **Comma-delimited CSV only.** No support for tab-, semicolon-, or
+  pipe-delimited files.
+- **A header row is required.** The first line is always treated as column
+  names; there’s no way to sort a headerless file.
+- **Single-column sort key only.** `--column` takes exactly one column;
+  there’s no multi-column or composite sort key.
 
 ## Requirements
 

@@ -1,12 +1,7 @@
 #!/usr/bin/env node
 
-// Gemini PRO 3 version
-// 2025-12-18 initial version
-// 2025-12-18 version 2 add output directory flag
-// 2026-07-13 version 2.1 normalize cases for robustness
-
-
 const fs = require('fs-extra');
+const os = require('os');
 const path = require('path');
 const csv = require('csv-parser');
 const fastCsv = require('fast-csv');
@@ -20,7 +15,10 @@ const streamPipeline = promisify(pipeline);
 
 // --- CONFIGURATION ---
 const CHUNK_SIZE = 50000;
-const TEMP_DIR = path.join(__dirname, 'temp_chunks');
+// Unique per-run temp dir under the OS temp root, not the package install dir:
+// under npx / a global install, __dirname can be read-only, and a shared path
+// would collide across concurrent runs. Created lazily in main().
+let TEMP_DIR = null;
 
 // --- ARGUMENTS ---
 const argv = yargs(hideBin(process.argv))
@@ -66,10 +64,29 @@ const areRowsEqual = (rowA, rowB) => {
 
 // --- MAIN LOGIC ---
 
+async function cleanupTempDir() {
+    if (TEMP_DIR) {
+        await fs.remove(TEMP_DIR);
+    }
+}
+
+// Best-effort cleanup on Ctrl-C / kill so a killed run doesn't leave a temp
+// dir behind. process.exit() here is safe since fs.remove has already run.
+let cleaningUp = false;
+async function cleanupAndExit(signal) {
+    if (cleaningUp) return;
+    cleaningUp = true;
+    console.error(`\nReceived ${signal}, cleaning up temp files...`);
+    await cleanupTempDir();
+    process.exit(1);
+}
+process.on('SIGINT', () => cleanupAndExit('SIGINT'));
+process.on('SIGTERM', () => cleanupAndExit('SIGTERM'));
+
 async function main() {
     try {
         console.log('--- CSV External Sort Tool (Pro) ---');
-        await fs.emptyDir(TEMP_DIR);
+        TEMP_DIR = await fs.mkdtemp(path.join(os.tmpdir(), 'sort-large-csv-'));
 
         // Ensure output directory exists
         if (argv.outputDir !== '.') {
@@ -83,12 +100,13 @@ async function main() {
         // 2. PHASE TWO: MERGING
         await mergeChunks(chunkFiles);
 
-        await fs.remove(TEMP_DIR);
+        await cleanupTempDir();
         console.log('\nDone! Temporary files cleaned up.');
 
     } catch (err) {
         console.error('\nFATAL ERROR:', err.message);
-        await fs.remove(TEMP_DIR);
+        await cleanupTempDir();
+        process.exitCode = 1;
     }
 }
 
@@ -107,18 +125,26 @@ async function createSortedChunks(inputFile) {
         const stream = fs.createReadStream(inputFile);
         stream.on('data', (chunk) => bar.increment(chunk.length));
 
-        stream.pipe(csv({
+        // Pause/resume must be called on the parser (the stream the 'data'
+        // listener is actually attached to), not on the raw file stream two
+        // hops upstream. Pausing the wrong stream doesn't throttle the
+        // parser's output, so rows keep arriving past CHUNK_SIZE with
+        // nowhere bounded to stop — on any input with more than one chunk,
+        // that raced the array to unbounded growth and OOM'd.
+        const parser = stream.pipe(csv({
     		mapHeaders: ({ header }) => header.trim().toLowerCase()
-}))
+}));
+
+        parser
             .on('headers', (h) => headers = h)
             .on('data', async (data) => {
                 rows.push(data);
                 if (rows.length >= CHUNK_SIZE) {
-                    stream.pause();
+                    parser.pause();
                     const chunkPath = await writeChunk(rows, chunkCount++, headers);
                     chunkFiles.push(chunkPath);
                     rows = [];
-                    stream.resume();
+                    parser.resume();
                 }
             })
             .on('end', async () => {
@@ -145,19 +171,52 @@ async function writeChunk(rows, index, headers) {
     });
 }
 
+// Pull one row from a paused-mode readable stream, waiting for 'readable' if
+// none is buffered yet. Deliberately NOT the flowing-mode once('data') /
+// once('end') pattern this replaced: 'end' fires exactly once for the whole
+// life of a stream, so re-registering a fresh once('end') listener every
+// call can miss it if it already fired (the readableEnded check below
+// catches that), and pause()/resume() ping-ponging in flowing mode can leave
+// a listener waiting on a 'data' that flow() already delivered to a
+// resolved-and-discarded earlier promise. That combination silently
+// stalled the merge mid-run — reproduced with two chunks and a run of
+// tied sort-column values at a chunk's tail (e.g. many exact amount
+// duplicates before a chunk boundary) dropping the tail rows with no error.
+function readNextRow(stream) {
+    return new Promise((resolve, reject) => {
+        const data = stream.read();
+        if (data !== null) {
+            resolve(data);
+            return;
+        }
+        if (stream.readableEnded) {
+            resolve(null);
+            return;
+        }
+        const onReadable = () => { cleanup(); resolve(readNextRow(stream)); };
+        const onEnd = () => { cleanup(); resolve(null); };
+        const onError = (err) => { cleanup(); reject(err); };
+        function cleanup() {
+            stream.removeListener('readable', onReadable);
+            stream.removeListener('end', onEnd);
+            stream.removeListener('error', onError);
+        }
+        stream.once('readable', onReadable);
+        stream.once('end', onEnd);
+        stream.once('error', onError);
+    });
+}
+
 async function mergeChunks(chunkFiles) {
     console.log(`\nPhase 2: Merging ${chunkFiles.length} chunks...`);
     if (chunkFiles.length === 0) return;
 
     const streams = chunkFiles.map(file => fs.createReadStream(file).pipe(csv({ mapHeaders: ({ header }) => header.trim().toLowerCase() })));
 
-    const streamHeads = await Promise.all(streams.map(stream => new Promise(resolve => {
-        stream.once('data', (data) => {
-            stream.pause();
-            resolve({ data, stream });
-        });
-        stream.on('end', () => resolve(null));
-    })));
+    const streamHeads = await Promise.all(streams.map(async (stream) => {
+        const data = await readNextRow(stream);
+        return data === null ? null : { data, stream };
+    }));
 
     let activeHeads = streamHeads.filter(h => h !== null);
 
@@ -240,16 +299,7 @@ async function mergeChunks(chunkFiles) {
         rowsProcessed++;
         if(rowsProcessed % 1000 === 0) mergeBar.update(rowsProcessed, { dupes: dupeCount });
 
-        const nextDataPromise = new Promise(resolve => {
-            winner.stream.once('data', (data) => {
-                winner.stream.pause();
-                resolve(data);
-            });
-            winner.stream.once('end', () => resolve(null));
-            winner.stream.resume();
-        });
-
-        const nextData = await nextDataPromise;
+        const nextData = await readNextRow(winner.stream);
         if (nextData) {
             winner.data = nextData;
         } else {
@@ -266,4 +316,9 @@ async function mergeChunks(chunkFiles) {
     }
 }
 
-main();
+// Guard against side effects on require(): removing "main" from package.json
+// doesn't stop Node from falling back to this file (its literal filename is
+// index.js), so only run automatically when invoked directly as the CLI.
+if (require.main === module) {
+    main();
+}

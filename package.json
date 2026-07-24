@@ -16,7 +16,6 @@
   "bin": {
     "sort-large-csv": "index.js"
   },
-  "main": "index.js",
   "type": "commonjs",
   "files": [
     "index.js",
@@ -29,10 +28,6 @@
   "engines": {
     "node": ">=18"
   },
-  "os": [
-    "darwin",
-    "linux"
-  ],
   "author": "Dan Gaidula <dan@iceboxind.com>",
   "license": "MIT",
   "repository": {
