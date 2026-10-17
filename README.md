@@ -104,6 +104,19 @@ Splits `orders.csv` into one file per distinct `region` value, written into
 - **Single-column sort key only.** `--column` takes exactly one column;
   there’s no multi-column or composite sort key.
 
+## Exit codes
+
+| Code | Meaning |
+|--:|---|
+| `0` | Ran to completion. |
+| `1` | Partial: ran to completion but some items failed. Reserved — this tool has no per-item failure condition (a removed duplicate is a normal outcome), so it never exits `1`. |
+| `2` | Usage: a required option (`--input`, `--column`) is missing, an option is given more than once, or the input path doesn’t exist or isn’t a file. |
+| `3` | Could not complete: an environment or internal failure, such as an unusable temp location, an output directory that can’t be created or written to, a disk-full or other I/O error, or an interrupt (SIGINT/SIGTERM). |
+
+`--help` exits `0`. Errors print a one-line `error: …` on stderr (usage errors
+also print the option list first). Temporary files are removed on every exit
+path. Stdout on a successful run is unchanged from 1.x.
+
 ## Requirements
 
 Node 18+.

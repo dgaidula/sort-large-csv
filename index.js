@@ -19,6 +19,34 @@ const CHUNK_SIZE = 50000;
 // under npx / a global install, __dirname can be read-only, and a shared path
 // would collide across concurrent runs. Created lazily in main().
 let TEMP_DIR = null;
+// Progress bar currently running, so a failure can stop it (a live bar keeps
+// the event loop alive and leaves the cursor hidden).
+let activeBar = null;
+
+// --- EXIT CODES ---
+// 0 ok, 1 partial (ran to completion, some items failed), 2 usage, 3 could not
+// complete. This tool has no per-item failure condition, so it never exits 1.
+const EXIT = { OK: 0, PARTIAL: 1, USAGE: 2, FAILED: 3 };
+
+class UsageError extends Error {}
+
+const oneLine = (msg) => String(msg).replace(/\s*\n\s*/g, ' ').trim();
+
+function usageExit(msg) {
+    console.error(`error: ${oneLine(msg)}`);
+    process.exit(EXIT.USAGE);
+}
+
+// Safety net for anything not caught in main(): an unhandled stream 'error'
+// event or a rejection from an async stream handler. Sync cleanup, then exit.
+function fatalExit(err) {
+    console.error(`error: ${oneLine(err && err.message ? err.message : err)}`);
+    if (TEMP_DIR) {
+        try { fs.removeSync(TEMP_DIR); } catch (e) { /* best effort */ }
+    }
+    process.exit(EXIT.FAILED);
+}
+process.on('uncaughtException', fatalExit);
 
 // --- ARGUMENTS ---
 const argv = yargs(hideBin(process.argv))
@@ -28,7 +56,17 @@ const argv = yargs(hideBin(process.argv))
     .option('dedupe', { alias: 'd', type: 'boolean', description: 'Remove duplicate rows', default: false })
     .option('output', { alias: 'o', type: 'string', default: 'sorted_output.csv', description: 'Output filename (for single file mode)' })
     .option('output-dir', { alias: 'D', type: 'string', default: '.', description: 'Directory to save output files' })
+    .fail((msg, err, y) => {
+        if (err) fatalExit(err);
+        y.showHelp();
+        usageExit(msg);
+    })
     .argv;
+
+// A repeated option parses to an array; the tool has always crashed on that.
+for (const key of ['input', 'column', 'output', 'outputDir']) {
+    if (typeof argv[key] !== 'string') usageExit(`option --${key === 'outputDir' ? 'output-dir' : key} must be given exactly once`);
+}
 
 const sortCol = argv.column.trim().toLowerCase();
 
@@ -78,13 +116,14 @@ async function cleanupAndExit(signal) {
     cleaningUp = true;
     console.error(`\nReceived ${signal}, cleaning up temp files...`);
     await cleanupTempDir();
-    process.exit(1);
+    process.exit(EXIT.FAILED);
 }
 process.on('SIGINT', () => cleanupAndExit('SIGINT'));
 process.on('SIGTERM', () => cleanupAndExit('SIGTERM'));
 
 async function main() {
     try {
+        checkInput(argv.input);
         console.log('--- CSV External Sort Tool (Pro) ---');
         TEMP_DIR = await fs.mkdtemp(path.join(os.tmpdir(), 'sort-large-csv-'));
 
@@ -104,10 +143,25 @@ async function main() {
         console.log('\nDone! Temporary files cleaned up.');
 
     } catch (err) {
-        console.error('\nFATAL ERROR:', err.message);
+        console.error(`error: ${oneLine(err.message)}`);
+        process.exitCode = err instanceof UsageError ? EXIT.USAGE : EXIT.FAILED;
+        if (activeBar) activeBar.stop();
         await cleanupTempDir();
-        process.exitCode = 1;
     }
+}
+
+// Input path must exist and be a regular file; anything else is a usage error.
+function checkInput(inputFile) {
+    let st;
+    try {
+        st = fs.statSync(inputFile);
+    } catch (err) {
+        if (err.code === 'ENOENT' || err.code === 'ENOTDIR') {
+            throw new UsageError(`input file not found: ${inputFile}`);
+        }
+        throw err;
+    }
+    if (!st.isFile()) throw new UsageError(`input is not a file: ${inputFile}`);
 }
 
 async function createSortedChunks(inputFile) {
@@ -115,6 +169,7 @@ async function createSortedChunks(inputFile) {
     const fileSize = fs.statSync(inputFile).size;
     const bar = new cliProgress.SingleBar({}, cliProgress.Presets.shades_classic);
     bar.start(fileSize, 0);
+    activeBar = bar;
 
     let rows = [];
     let chunkCount = 0;
@@ -124,6 +179,7 @@ async function createSortedChunks(inputFile) {
     return new Promise((resolve, reject) => {
         const stream = fs.createReadStream(inputFile);
         stream.on('data', (chunk) => bar.increment(chunk.length));
+        stream.on('error', reject);
 
         // Pause/resume must be called on the parser (the stream the 'data'
         // listener is actually attached to), not on the raw file stream two
@@ -138,22 +194,30 @@ async function createSortedChunks(inputFile) {
         parser
             .on('headers', (h) => headers = h)
             .on('data', async (data) => {
-                rows.push(data);
-                if (rows.length >= CHUNK_SIZE) {
-                    parser.pause();
-                    const chunkPath = await writeChunk(rows, chunkCount++, headers);
-                    chunkFiles.push(chunkPath);
-                    rows = [];
-                    parser.resume();
+                try {
+                    rows.push(data);
+                    if (rows.length >= CHUNK_SIZE) {
+                        parser.pause();
+                        const chunkPath = await writeChunk(rows, chunkCount++, headers);
+                        chunkFiles.push(chunkPath);
+                        rows = [];
+                        parser.resume();
+                    }
+                } catch (err) {
+                    reject(err);
                 }
             })
             .on('end', async () => {
-                if (rows.length > 0) {
-                    const chunkPath = await writeChunk(rows, chunkCount++, headers);
-                    chunkFiles.push(chunkPath);
+                try {
+                    if (rows.length > 0) {
+                        const chunkPath = await writeChunk(rows, chunkCount++, headers);
+                        chunkFiles.push(chunkPath);
+                    }
+                    bar.stop();
+                    resolve(chunkFiles);
+                } catch (err) {
+                    reject(err);
                 }
-                bar.stop();
-                resolve(chunkFiles);
             })
             .on('error', reject);
     });
@@ -225,13 +289,25 @@ async function mergeChunks(chunkFiles) {
     let mainOutputStream = null;
     let dupeWriter = null;
 
+    // Track every output stream so a write failure (unwritable directory, disk
+    // full) fails the run instead of surfacing after "Done!" or not at all.
+    let outputError = null;
+    const outputDone = [];
+    const trackOutput = (ws) => {
+        outputDone.push(new Promise((resolve) => {
+            ws.on('finish', resolve);
+            ws.on('error', (err) => { outputError = outputError || err; resolve(); });
+        }));
+        return ws;
+    };
+
     // Resolve Output Path Helper
     const getOutputPath = (filename) => path.join(argv.outputDir, filename);
 
     // Setup Main Output (if not splitting)
     if (!argv.split) {
         const outPath = getOutputPath(argv.output);
-        mainOutputStream = fs.createWriteStream(outPath);
+        mainOutputStream = trackOutput(fs.createWriteStream(outPath));
         currentWriter = fastCsv.format({ headers: true });
         currentWriter.pipe(mainOutputStream);
     }
@@ -239,7 +315,7 @@ async function mergeChunks(chunkFiles) {
     // Setup Dedupe Log (Always goes to output dir)
     if (argv.dedupe) {
         const dupePath = getOutputPath('duplicates_log.csv');
-        const dupeStream = fs.createWriteStream(dupePath);
+        const dupeStream = trackOutput(fs.createWriteStream(dupePath));
         dupeWriter = fastCsv.format({ headers: true });
         dupeWriter.pipe(dupeStream);
     }
@@ -248,12 +324,14 @@ async function mergeChunks(chunkFiles) {
         format: 'Merging | {bar} | {value} Rows | {dupes} Dupes Found'
     }, cliProgress.Presets.shades_classic);
     mergeBar.start(100, 0, { dupes: 0 });
+    activeBar = mergeBar;
 
     let rowsProcessed = 0;
     let dupeCount = 0;
     const seenRowKeys = new Set(); // global exact-row dedupe (see note below)
 
     while (activeHeads.length > 0) {
+        if (outputError) throw outputError;
         activeHeads.sort((a, b) => compareRows(a.data, b.data));
         const winner = activeHeads[0];
         const currentRow = winner.data;
@@ -285,7 +363,7 @@ async function mergeChunks(chunkFiles) {
 
                     // Create new split file in the output directory
                     const filename = getSafeFilename(rowVal);
-                    const ws = fs.createWriteStream(getOutputPath(filename));
+                    const ws = trackOutput(fs.createWriteStream(getOutputPath(filename)));
 
                     currentWriter = fastCsv.format({ headers: true });
                     currentWriter.pipe(ws);
@@ -310,6 +388,8 @@ async function mergeChunks(chunkFiles) {
     if (currentWriter) currentWriter.end();
     if (dupeWriter) dupeWriter.end();
     mergeBar.stop();
+    await Promise.all(outputDone);
+    if (outputError) throw outputError;
 
     if (argv.dedupe) {
         console.log(`\nCompleted. Removed ${dupeCount} duplicates.`);

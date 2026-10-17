@@ -1,6 +1,6 @@
 {
   "name": "sort-large-csv",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "External merge sort for CSVs larger than memory — sorts by column, optional split-by-value output, and global exact-row dedup.",
   "keywords": [
     "csv",
@@ -23,7 +23,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test": "node --test"
   },
   "engines": {
     "node": ">=18"
