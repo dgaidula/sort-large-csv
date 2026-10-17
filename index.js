@@ -33,6 +33,7 @@ class UsageError extends Error {}
 const oneLine = (msg) => String(msg).replace(/\s*\n\s*/g, ' ').trim();
 
 function usageExit(msg) {
+    cli.showHelp();
     console.error(`error: ${oneLine(msg)}`);
     process.exit(EXIT.USAGE);
 }
@@ -49,19 +50,20 @@ function fatalExit(err) {
 process.on('uncaughtException', fatalExit);
 
 // --- ARGUMENTS ---
-const argv = yargs(hideBin(process.argv))
-    .option('input', { alias: 'i', type: 'string', demandOption: true })
-    .option('column', { alias: 'c', type: 'string', demandOption: true })
+const cli = yargs(hideBin(process.argv))
+    .strict()
+    .option('input', { alias: 'i', type: 'string', demandOption: true, requiresArg: true })
+    .option('column', { alias: 'c', type: 'string', demandOption: true, requiresArg: true })
     .option('split', { alias: 's', type: 'boolean', default: false })
     .option('dedupe', { alias: 'd', type: 'boolean', description: 'Remove duplicate rows', default: false })
-    .option('output', { alias: 'o', type: 'string', default: 'sorted_output.csv', description: 'Output filename (for single file mode)' })
-    .option('output-dir', { alias: 'D', type: 'string', default: '.', description: 'Directory to save output files' })
+    .option('output', { alias: 'o', type: 'string', default: 'sorted_output.csv', requiresArg: true, description: 'Output filename (for single file mode)' })
+    .option('output-dir', { alias: 'D', type: 'string', default: '.', requiresArg: true, description: 'Directory to save output files' })
     .fail((msg, err, y) => {
-        if (err) fatalExit(err);
-        y.showHelp();
-        usageExit(msg);
-    })
-    .argv;
+        // yargs reports some usage errors (an option with no value) as a YError.
+        if (err && err.name !== 'YError') fatalExit(err);
+        usageExit(msg || err.message);
+    });
+const argv = cli.argv;
 
 // A repeated option parses to an array; the tool has always crashed on that.
 for (const key of ['input', 'column', 'output', 'outputDir']) {
@@ -143,9 +145,10 @@ async function main() {
         console.log('\nDone! Temporary files cleaned up.');
 
     } catch (err) {
+        if (activeBar) activeBar.stop();
+        if (err instanceof UsageError) cli.showHelp();
         console.error(`error: ${oneLine(err.message)}`);
         process.exitCode = err instanceof UsageError ? EXIT.USAGE : EXIT.FAILED;
-        if (activeBar) activeBar.stop();
         await cleanupTempDir();
     }
 }
@@ -192,7 +195,16 @@ async function createSortedChunks(inputFile) {
 }));
 
         parser
-            .on('headers', (h) => headers = h)
+            .on('headers', (h) => {
+                headers = h;
+                // A column not in the header would silently sort nothing and,
+                // with --split, put every row in output_empty.csv.
+                if (!h.includes(sortCol)) {
+                    parser.destroy();
+                    stream.destroy();
+                    reject(new UsageError(`column not found: ${argv.column} (columns: ${h.join(', ')})`));
+                }
+            })
             .on('data', async (data) => {
                 try {
                     rows.push(data);

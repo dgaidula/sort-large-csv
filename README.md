@@ -110,7 +110,7 @@ Splits `orders.csv` into one file per distinct `region` value, written into
 |--:|---|
 | `0` | Ran to completion. |
 | `1` | Partial: ran to completion but some items failed. Reserved — this tool has no per-item failure condition (a removed duplicate is a normal outcome), so it never exits `1`. |
-| `2` | Usage: a required option (`--input`, `--column`) is missing, an option is given more than once, or the input path doesn’t exist or isn’t a file. |
+| `2` | Usage: a required option (`--input`, `--column`) is missing, an option is unknown, has no value or is given more than once, the input path doesn’t exist or isn’t a file, or the `--column` isn’t in the header (the error lists the header’s columns). |
 | `3` | Could not complete: an environment or internal failure, such as an unusable temp location, an output directory that can’t be created or written to, a disk-full or other I/O error, or an interrupt (SIGINT/SIGTERM). |
 
 `--help` exits `0`. Errors print a one-line `error: …` on stderr (usage errors
