@@ -13,6 +13,8 @@ npx sort-large-csv --help
 
 Or install it: `npm i -g sort-large-csv`, then run `sort-large-csv ...`.
 
+**Hardened:** 2026-10-30 · 461a25d · gate CLOSED WITH FOLLOW-UPS
+
 ## What it’s good for
 
 Sorting or splitting CSVs that are too big to load into memory or to sort
@@ -35,8 +37,9 @@ stream per chunk.
 Sort comparison is type-aware. Each value is one kind, and the kinds always
 sort in this order: empty, numbers, ISO dates and date-times, clock times,
 then text. Two values of the same kind compare by value (text by a string
-locale compare), so a column that mixes kinds still sorts the same way
-whatever the chunk size:
+locale compare), so a column that mixes kinds puts its values in the same
+order whatever the chunk size. (Rows whose sort values are equal are not kept
+in input order: their relative order can differ with the chunk size.)
 
 - **Numbers**: the whole value is a plain decimal number, optionally signed,
   with an optional exponent (`10`, `-3.5`, `.5`, `1e2`). `1,000`, `$5` and
