@@ -207,3 +207,103 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
         assert.deepEqual(fs.readdirSync(tmp).filter((n) => n.startsWith('sort-large-csv-')), []);
     });
 }
+
+// --- 2.0.0 release fixes ---------------------------------------------------
+
+function runIn(input, args, extraEnv) {
+    const file = path.join(scratch, `in${runCount}.csv`);
+    fs.writeFileSync(file, input);
+    return run(CLI, ['-i', file, ...args], extraEnv);
+}
+const dataRows = (text) => text.replace(/\r\n/g, '\n').split('\n').filter(Boolean).slice(1);
+
+test('chunk boundaries: exact multiples and non-multiples keep every row exactly once (several runs)', () => {
+    const make = (n) => 'id,amt\n' + Array.from({ length: n }, (_, i) => `u${i},${(i * 7919) % 100003}`).join('\n') + '\n';
+    const check = (n, env, label) => {
+        const r = runIn(make(n), ['-c', 'amt', '-o', 'out.csv'], env);
+        assert.equal(r.status, 0, `${label}: ${r.stderr}`);
+        const out = dataRows(fs.readFileSync(path.join(r.dir, 'out.csv'), 'utf8'));
+        assert.equal(out.length, n, `${label}: row count`);
+        assert.equal(new Set(out).size, n, `${label}: every row once`);
+        const amts = out.map((l) => Number(l.split(',')[1]));
+        assert.ok(amts.every((v, i) => i === 0 || amts[i - 1] <= v), `${label}: sorted`);
+    };
+    // The default 50,000-row chunk at exactly 2 chunks (raced in most 1.0.0 runs).
+    for (let run = 1; run <= 3; run++) check(100000, {}, `100000 rows, run ${run}`);
+    // Small chunks: many boundaries, on and off a multiple.
+    for (const n of [999, 1000, 1001, 2000, 2500, 3000]) {
+        for (let run = 1; run <= 2; run++) check(n, { SORT_LARGE_CSV_CHUNK_SIZE: '1000' }, `${n} rows / 1000-row chunks, run ${run}`);
+    }
+});
+
+test('ISO dates, date-times and clock times sort chronologically; plain numbers numerically', () => {
+    const sorted = (header, values) => {
+        const r = runIn(`id,${header}\n` + values.map((v, i) => `${i},${v}`).join('\n') + '\n', ['-c', header, '-o', 'out.csv']);
+        assert.equal(r.status, 0, r.stderr);
+        return dataRows(fs.readFileSync(path.join(r.dir, 'out.csv'), 'utf8')).map((l) => l.split(',')[1]);
+    };
+    assert.deepEqual(sorted('date', ['2024-03-01', '2024-01-15', '2023-12-31', '2024-02-10', '2023-01-05']),
+        ['2023-01-05', '2023-12-31', '2024-01-15', '2024-02-10', '2024-03-01']);
+    assert.deepEqual(sorted('at', ['2024-03-01T10:00:00Z', '2024-03-01 09:30', '2024-03-01T12:00:00+05:00', '2024-03-01']),
+        ['2024-03-01', '2024-03-01T12:00:00+05:00', '2024-03-01 09:30', '2024-03-01T10:00:00Z']);
+    assert.deepEqual(sorted('time', ['10:30', '10:05', '9:05', '1:15 PM', '12:00 AM', '23:59:59']),
+        ['12:00 AM', '9:05', '10:05', '10:30', '1:15 PM', '23:59:59']);
+    assert.deepEqual(sorted('amt', ['10', '2', '-3.5', '1e2', '.5']), ['-3.5', '.5', '2', '10', '1e2']);
+});
+
+test('--split never loses rows: colliding and non-Latin names get their own files, tied values append', () => {
+    const r = runIn('id,city\n1,New York\n2,NEW YORK\n3,new-york\n4,Boston\n5,東京\n6,大阪\n7,New York\n', ['-c', 'city', '--split', '-D', 's']);
+    assert.equal(r.status, 0, r.stderr);
+    const dir = path.join(r.dir, 's');
+    const files = Object.fromEntries(fs.readdirSync(dir).map((f) => [f, dataRows(fs.readFileSync(path.join(dir, f), 'utf8'))]));
+    assert.equal(Object.values(files).flat().length, 7);
+    assert.deepEqual(files['output_new_york.csv'], ['1,New York', '7,New York']);
+    assert.deepEqual(files['output_new_york_2.csv'], ['2,NEW YORK']);
+    assert.deepEqual(files['output_new_york_3.csv'], ['3,new-york']);
+    assert.deepEqual(files['output_東京.csv'], ['5,東京']);
+    assert.deepEqual(files['output_大阪.csv'], ['6,大阪']);
+
+    // 10 and 10.0 tie, so with 2-row chunks the merge goes 10, 10.0, 10.0, 10:
+    // the second visit to 10 must append, not truncate.
+    const t = runIn('id,v\na,10\nb,10.0\nc,10.0\nd,10\n', ['-c', 'v', '--split', '-D', 's'], { SORT_LARGE_CSV_CHUNK_SIZE: '2' });
+    assert.equal(t.status, 0, t.stderr);
+    const read = (f) => fs.readFileSync(path.join(t.dir, 's', f), 'utf8');
+    assert.equal(read('output_10.csv'), 'id,v\na,10\nd,10');
+    assert.equal(read('output_10_0.csv'), 'id,v\nb,10.0\nc,10.0');
+});
+
+test('exit 2 on duplicate header names, including case variants', () => {
+    for (const header of ['Name,Phone,phone,Amt', 'Name,Phone,Phone,Amt']) {
+        const r = runIn(`${header}\nb,111,222,2\na,333,444,1\n`, ['-c', 'amt', '-o', 'out.csv']);
+        assert.equal(r.status, 2, header);
+        assert.match(r.stderr, /^error: duplicate column name \(matched case-insensitively\): "phone"$/m);
+        assert.equal(fs.existsSync(path.join(r.dir, 'out.csv')), false);
+        assert.deepEqual(r.leftovers, []);
+    }
+});
+
+test('rows with more fields than the header are warned about and counted', () => {
+    const r = runIn('name,amt\nb,2,EXTRA1,EXTRA2\na,1\nc,3,X\n', ['-c', 'amt', '-o', 'out.csv']);
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stderr, /^warning: 2 rows had more fields than the header \(first: data row 1\); the extra fields were dropped\.$/m);
+});
+
+test('a header-only input writes a header-only output (replacing a stale one); a 0-byte input exits 2', () => {
+    const file = path.join(scratch, 'header-only.csv');
+    fs.writeFileSync(file, 'Name,Amt\n');
+    const dir = path.join(scratch, `run${runCount}`); // the dir run() uses next
+    fs.mkdirSync(dir);
+    fs.writeFileSync(path.join(dir, 'sorted_output.csv'), 'STALE FROM LAST RUN\n');
+    const r = run(CLI, ['-i', file, '-c', 'amt', '--dedupe']);
+    assert.equal(r.dir, dir);
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /0 data rows/);
+    assert.equal(fs.readFileSync(path.join(dir, 'sorted_output.csv'), 'utf8'), 'name,amt');
+    assert.equal(fs.readFileSync(path.join(dir, 'duplicates_log.csv'), 'utf8'), '');
+    assert.deepEqual(r.leftovers, []);
+
+    const empty = runIn('', ['-c', 'amt']);
+    assert.equal(empty.status, 2);
+    assert.match(empty.stderr, /^error: input has no header row/m);
+    assert.deepEqual(empty.leftovers, []);
+});

@@ -14,7 +14,11 @@ const { promisify } = require('util');
 const streamPipeline = promisify(pipeline);
 
 // --- CONFIGURATION ---
-const CHUNK_SIZE = 50000;
+// Rows per sorted chunk. SORT_LARGE_CSV_CHUNK_SIZE overrides it (the tests use
+// small chunks to cross many chunk boundaries quickly).
+const CHUNK_SIZE = parseInt(process.env.SORT_LARGE_CSV_CHUNK_SIZE, 10) > 0
+    ? parseInt(process.env.SORT_LARGE_CSV_CHUNK_SIZE, 10)
+    : 50000;
 // Unique per-run temp dir under the OS temp root, not the package install dir:
 // under npx / a global install, __dirname can be read-only, and a shared path
 // would collide across concurrent runs. Created lazily in main().
@@ -79,16 +83,46 @@ const compareRows = (a, b) => {
     const valA = (a[sortCol] !== undefined && a[sortCol] !== null) ? String(a[sortCol]).trim() : '';
     const valB = (b[sortCol] !== undefined && b[sortCol] !== null) ? String(b[sortCol]).trim() : '';
 
-    const numA = parseFloat(valA);
-    const numB = parseFloat(valB);
+    const keyA = sortKey(valA);
+    const keyB = sortKey(valB);
 
-    if (!isNaN(numA) && !isNaN(numB)) return numA - numB;
+    if (keyA && keyB && keyA.kind === keyB.kind) return keyA.n - keyB.n;
     return valA.localeCompare(valB);
 };
 
-const getSafeFilename = (val) => {
-    const safe = (val || 'empty').toString().replace(/[^a-z0-9]/gi, '_').toLowerCase();
-    return `output_${safe}.csv`;
+// A value compares numerically against another of the same kind: a whole
+// plain number (not "2024-03-01", which parseFloat reads as 2024), an ISO
+// date or date-time, or a clock time. Anything else returns null and sorts
+// as text.
+const NUMBER_RE = /^[-+]?(\d+\.?\d*|\.\d+)(e[-+]?\d+)?$/i;
+const ISO_DATE_RE = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(\.\d+)?)?)?\s*(Z|[+-]\d{2}:?\d{2})?$/i;
+const TIME_RE = /^(\d{1,2}):(\d{2})(?::(\d{2})(\.\d+)?)?\s*([AP]M)?$/i;
+function sortKey(val) {
+    if (NUMBER_RE.test(val)) return { kind: 'number', n: parseFloat(val) };
+    let m = val.match(ISO_DATE_RE);
+    if (m) {
+        let n = Date.UTC(+m[1], +m[2] - 1, +m[3], +(m[4] || 0), +(m[5] || 0), +(m[6] || 0)) + (m[7] ? parseFloat(m[7]) * 1000 : 0);
+        if (m[8] && m[8].toUpperCase() !== 'Z') {
+            const off = m[8].replace(':', '');
+            n -= (off[0] === '-' ? -1 : 1) * (+off.slice(1, 3) * 60 + +off.slice(3, 5)) * 60000;
+        }
+        return { kind: 'date', n };
+    }
+    m = val.match(TIME_RE);
+    if (m) {
+        let h = +m[1];
+        if (m[5]) h = (h % 12) + (m[5].toUpperCase() === 'PM' ? 12 : 0);
+        return { kind: 'time', n: h * 3600 + +m[2] * 60 + +(m[3] || 0) + (m[4] ? parseFloat(m[4]) : 0) };
+    }
+    return null;
+}
+
+// Split file name for a value: letters (any script) and digits kept,
+// everything else '_', lowercased, NFC so macOS sees one name; `n` numbers
+// the second and later values that map to the same name.
+const getSafeFilename = (val, n) => {
+    const safe = (val || 'empty').toString().normalize('NFC').replace(/[^\p{L}\p{N}]/gu, '_').toLowerCase();
+    return `output_${safe}${n ? `_${n}` : ''}.csv`;
 };
 
 const areRowsEqual = (rowA, rowB) => {
@@ -136,10 +170,11 @@ async function main() {
         }
 
         // 1. PHASE ONE: CHUNKING
-        const chunkFiles = await createSortedChunks(argv.input);
+        const { chunkFiles, headers } = await createSortedChunks(argv.input);
+        if (!headers) throw new UsageError(`input has no header row: ${argv.input}`);
 
         // 2. PHASE TWO: MERGING
-        await mergeChunks(chunkFiles);
+        await mergeChunks(chunkFiles, headers);
 
         await cleanupTempDir();
         console.log('\nDone! Temporary files cleaned up.');
@@ -194,25 +229,56 @@ async function createSortedChunks(inputFile) {
     		mapHeaders: ({ header }) => header.trim().toLowerCase()
 }));
 
+        // The chunk write in flight, if any. 'end' can fire while the last
+        // full chunk is still being written (the parser has nothing left to
+        // pause), so the buffer is swapped out before the write and 'end'
+        // waits for it -- otherwise those rows were written a second time.
+        let inFlight = null;
+        let raggedRows = 0;
+        let firstRagged = 0;
+        let rowNumber = 0;
+
         parser
             .on('headers', (h) => {
                 headers = h;
+                const fail = (msg) => {
+                    parser.destroy();
+                    stream.destroy();
+                    reject(new UsageError(msg));
+                };
+                // Header names are matched case-insensitively, so two that
+                // differ only in case would collapse into one column.
+                const dupes = [...new Set(h.filter((name, i) => h.indexOf(name) !== i))];
+                if (dupes.length) {
+                    fail(`duplicate column name${dupes.length > 1 ? 's' : ''} (matched case-insensitively): ${dupes.map((d) => `"${d}"`).join(', ')}`);
+                    return;
+                }
                 // A column not in the header would silently sort nothing and,
                 // with --split, put every row in output_empty.csv.
                 if (!h.includes(sortCol)) {
-                    parser.destroy();
-                    stream.destroy();
-                    reject(new UsageError(`column not found: ${argv.column} (columns: ${h.join(', ')})`));
+                    fail(`column not found: ${argv.column} (columns: ${h.join(', ')})`);
                 }
             })
             .on('data', async (data) => {
                 try {
+                    rowNumber++;
+                    if (Object.keys(data).length > headers.length) {
+                        if (!raggedRows) firstRagged = rowNumber;
+                        raggedRows++;
+                    }
                     rows.push(data);
                     if (rows.length >= CHUNK_SIZE) {
+                        // pause() is the backpressure: no row may arrive
+                        // while a chunk is being written. A second full
+                        // chunk during a write means it isn't working and
+                        // memory is growing without bound.
+                        if (inFlight) throw new Error('internal: a chunk filled while the previous one was still being written');
                         parser.pause();
-                        const chunkPath = await writeChunk(rows, chunkCount++, headers);
-                        chunkFiles.push(chunkPath);
+                        const full = rows;
                         rows = [];
+                        inFlight = writeChunk(full, chunkCount++, headers).then((chunkPath) => { chunkFiles.push(chunkPath); });
+                        await inFlight;
+                        inFlight = null;
                         parser.resume();
                     }
                 } catch (err) {
@@ -221,12 +287,16 @@ async function createSortedChunks(inputFile) {
             })
             .on('end', async () => {
                 try {
+                    if (inFlight) await inFlight;
                     if (rows.length > 0) {
                         const chunkPath = await writeChunk(rows, chunkCount++, headers);
                         chunkFiles.push(chunkPath);
                     }
                     bar.stop();
-                    resolve(chunkFiles);
+                    if (raggedRows) {
+                        console.error(`warning: ${raggedRows} row${raggedRows === 1 ? '' : 's'} had more fields than the header (first: data row ${firstRagged}); the extra fields were dropped.`);
+                    }
+                    resolve({ chunkFiles, headers });
                 } catch (err) {
                     reject(err);
                 }
@@ -283,9 +353,22 @@ function readNextRow(stream) {
     });
 }
 
-async function mergeChunks(chunkFiles) {
+async function mergeChunks(chunkFiles, headers) {
     console.log(`\nPhase 2: Merging ${chunkFiles.length} chunks...`);
-    if (chunkFiles.length === 0) return;
+    if (chunkFiles.length === 0) {
+        // A header with no data rows: still write (and so replace) the
+        // output, header only, so a later step never reads a stale file.
+        console.log('The input has a header and 0 data rows.');
+        const outputs = [];
+        if (!argv.split) outputs.push({ file: argv.output, writer: fastCsv.format({ headers, alwaysWriteHeaders: true }) });
+        if (argv.dedupe) outputs.push({ file: 'duplicates_log.csv', writer: fastCsv.format({ headers: true }) });
+        for (const { file, writer } of outputs) {
+            const done = streamPipeline(writer, fs.createWriteStream(path.join(argv.outputDir, file)));
+            writer.end();
+            await done;
+        }
+        return;
+    }
 
     const streams = chunkFiles.map(file => fs.createReadStream(file).pipe(csv({ mapHeaders: ({ header }) => header.trim().toLowerCase() })));
 
@@ -298,6 +381,8 @@ async function mergeChunks(chunkFiles) {
 
     let currentWriter = null;
     let currentSplitVal = null;
+    const splitFiles = new Map(); // split value -> its file name
+    const splitNames = new Map(); // file name -> settles when its last writer closes
     let mainOutputStream = null;
     let dupeWriter = null;
 
@@ -373,11 +458,25 @@ async function mergeChunks(chunkFiles) {
                     if (currentWriter) currentWriter.end();
                     currentSplitVal = rowVal;
 
-                    // Create new split file in the output directory
-                    const filename = getSafeFilename(rowVal);
-                    const ws = trackOutput(fs.createWriteStream(getOutputPath(filename)));
+                    // One file per distinct value for the whole merge. A value
+                    // whose safe name is taken (New York / NEW YORK / new-york)
+                    // gets a numbered name; a value that comes back after a
+                    // tie (10 / 10.0 / 10) appends to its file once the
+                    // earlier writer has finished, instead of truncating it.
+                    let filename = splitFiles.get(rowVal);
+                    const revisit = filename !== undefined;
+                    if (!revisit) {
+                        filename = getSafeFilename(rowVal);
+                        for (let n = 2; splitNames.has(filename); n++) filename = getSafeFilename(rowVal, n);
+                        splitFiles.set(rowVal, filename);
+                    } else {
+                        await splitNames.get(filename);
+                    }
+                    const ws = trackOutput(fs.createWriteStream(getOutputPath(filename), { flags: revisit ? 'a' : 'w' }));
+                    splitNames.set(filename, new Promise((resolve) => { ws.on('close', resolve); ws.on('error', resolve); }));
+                    if (revisit) ws.write('\n'); // fast-csv ends a file without a row delimiter
 
-                    currentWriter = fastCsv.format({ headers: true });
+                    currentWriter = fastCsv.format({ headers: true, writeHeaders: !revisit });
                     currentWriter.pipe(ws);
                 }
                 currentWriter.write(currentRow);
