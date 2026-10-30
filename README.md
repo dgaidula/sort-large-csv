@@ -32,12 +32,16 @@ stream per chunk.
    in fully sorted order. Temp files are cleaned up when the run finishes (or
    fails).
 
-Sort comparison is type-aware. Two values of the same recognized kind compare
-by value; anything else falls back to a string locale compare:
+Sort comparison is type-aware. Each value is one kind, and the kinds always
+sort in this order: empty, numbers, ISO dates and date-times, clock times,
+then text. Two values of the same kind compare by value (text by a string
+locale compare), so a column that mixes kinds still sorts the same way
+whatever the chunk size:
 
 - **Numbers**: the whole value is a plain decimal number, optionally signed,
   with an optional exponent (`10`, `-3.5`, `.5`, `1e2`). `1,000`, `$5` and
-  `12%` are text.
+  `12%` are text. A ZIP+4 (`10001-1234`) sorts with the numbers, just after
+  its 5-digit ZIP, so a ZIP column that mixes the two stays in ZIP order.
 - **ISO dates and date-times**: `YYYY-MM-DD`, optionally followed by `T` or a
   space and `HH:MM`, `HH:MM:SS` or `HH:MM:SS.fff`, and an optional `Z` or
   `±HH:MM` offset. A value with no offset is read as UTC, and a date alone is
@@ -45,7 +49,8 @@ by value; anything else falls back to a string locale compare:
 - **Clock times**: `H:MM` or `HH:MM:SS` (optional `.fff`), with an optional
   `AM`/`PM` (`9:05` sorts before `10:30`; `12:00 AM` is midnight).
 
-Other date formats (`03/01/2024`, `1 March 2024`) sort as text. Column headers are matched case-insensitively (trimmed and
+Other date formats (`03/01/2024`, `1 March 2024`), and dates or times that
+don’t exist (`2024-02-30`, `10:75`), sort as text. Column headers are matched case-insensitively (trimmed and
 lowercased), so `--column Email` matches an `Email`, `EMAIL`, or ` email `
 header.
 
@@ -69,8 +74,10 @@ header.
 It’s a *global* dedup: every row is checked against every row seen so far in
 the entire file, not just the row immediately before it, so duplicates are
 caught regardless of where they land after sorting (e.g. two identical rows
-that sort into different, non-adjacent chunks). Distinct rows are never
-merged or altered — only byte-for-byte duplicates are dropped.
+that sort into different, non-adjacent chunks). Rows are compared whole,
+including any fields beyond the header that are left out of the output (see
+Notes), so distinct rows are never merged or altered — only byte-for-byte
+duplicates are dropped.
 
 Removed rows are written to `duplicates_log.csv` in the output directory, so
 nothing is silently discarded.
@@ -106,8 +113,11 @@ Splits `orders.csv` into one file per distinct `region` value, written into
   no rows are lost. An empty value goes to `output_empty.csv`.
 - A header-only input writes a header-only output (replacing any earlier
   output) and says it had 0 data rows. A 0-byte input is a usage error.
-- A row with more fields than the header keeps only the header’s columns;
-  the run warns on stderr with how many rows were affected and the first one.
+- A row with more fields than the header keeps only the header’s columns in
+  the output; the run warns on stderr with how many rows were affected and the
+  first one, and exits `1`.
+- An empty header cell (`Name,Amt,,` from a spreadsheet export) is named by
+  its position: `column_3`, `column_4`.
 
 ## Limitations
 
@@ -125,8 +135,9 @@ Splits `orders.csv` into one file per distinct `region` value, written into
 
 ## Known limits
 
-- **Extra fields on a ragged row are dropped** (with a warning and a count,
-  not silently); fix the input or add header names for them.
+- **Extra fields on a ragged row are dropped** from the output (with a
+  warning, a count and exit `1`, not silently); fix the input or add header
+  names for them.
 - **The output header is lowercased** (`Name,Amt` → `name,amt`), CRLF line ends
   become LF, and the output has no trailing newline.
 - **An absolute `-o` path is placed under `--output-dir`** (`path.join`); pass
@@ -153,7 +164,7 @@ Splits `orders.csv` into one file per distinct `region` value, written into
 | Code | Meaning |
 |--:|---|
 | `0` | Ran to completion. |
-| `1` | Partial: ran to completion but some items failed. Reserved — this tool has no per-item failure condition (a removed duplicate is a normal outcome), so it never exits `1`. |
+| `1` | Partial: ran to completion, but at least one row had more fields than the header, and those extra fields are not in the output (the stderr warning gives the count and the first row). A removed duplicate is a normal outcome, not a failure. |
 | `2` | Usage: a required option (`--input`, `--column`) is missing, an option is unknown, has no value or is given more than once, the input path doesn’t exist or isn’t a file, the input has no header row (a 0-byte file), two header names are the same apart from case, or the `--column` isn’t in the header (the error lists the header’s columns). |
 | `3` | Could not complete: an environment or internal failure, such as an unusable temp location, an output directory that can’t be created or written to, a disk-full or other I/O error, or an interrupt (SIGINT/SIGTERM). |
 
@@ -174,7 +185,13 @@ See [CHANGELOG.md](./CHANGELOG.md) for the full list. What can break a script:
   `--split`). So are duplicate header names and a 0-byte input.
 - **Sort order.** Dates, date-times and clock times sort chronologically, and
   only whole plain numbers sort numerically: 1.0.0 read `2024-03-01` as
-  `2024` and `10 apples` as `10`.
+  `2024` and `10 apples` as `10`. A column that mixes kinds sorts empty,
+  numbers, dates, times, then text.
+- **Ragged rows exit `1`.** A row with more fields than the header still
+  loses the extra fields from the output, but the run warns and exits `1`
+  (1.0.0 dropped them silently with `0`).
+- **Empty header cells** are named `column_3` and so on; 1.0.0 merged them
+  into one column and lost all but the last one’s values.
 - **Split file names.** Letters outside A–Z are kept (`output_zürich.csv`,
   where 1.0.0 wrote `output_z_rich.csv`), and values that collide get
   numbered names. 1.0.0 overwrote the earlier file and lost its rows.
@@ -184,7 +201,8 @@ See [CHANGELOG.md](./CHANGELOG.md) for the full list. What can break a script:
 - **Header-only inputs** write a header-only output; 1.0.0 wrote nothing and
   left any earlier output in place.
 
-On other input, stdout and the output files are the same as in 1.0.0.
+On other input, stdout and the output files are the same as in 1.0.0, except
+that one removed row now reads `Removed 1 duplicate.` (1.0.0: “1 duplicates”).
 
 ## Requirements
 

@@ -81,7 +81,8 @@ test('clean-run output is byte-identical to 1.0.0 (stdout and files)', () => {
         const b = run(CLI, args);
         assert.equal(a.status, 0, a.stderr);
         assert.equal(b.status, 0, b.stderr);
-        assert.equal(b.stdout, a.stdout);
+        // 2.0.0 says "Removed 1 duplicate." (1.0.0: "1 duplicates"); nothing else differs.
+        assert.equal(b.stdout, a.stdout.replace('Removed 1 duplicates.', 'Removed 1 duplicate.'));
         const ta = tree(a.dir);
         const tb = tree(b.dir);
         assert.deepEqual(Object.keys(tb), Object.keys(ta));
@@ -142,9 +143,7 @@ test('exit 3 when the output directory is not writable', { skip: process.getuid 
     }
 });
 
-// There is no exit 1 test: the tool has no per-item failure condition (a
-// duplicate row is a normal outcome, and nothing is reported as skipped), so
-// it never exits 1.
+// Exit 1 (a row's extra fields were dropped) is tested with the 2.0.0 fixes below.
 
 test('exit 2 when --column is not in the header, naming it and the columns', () => {
     for (const extra of [[], ['--split']]) {
@@ -282,9 +281,10 @@ test('exit 2 on duplicate header names, including case variants', () => {
     }
 });
 
-test('rows with more fields than the header are warned about and counted', () => {
+test('rows with more fields than the header are warned about and counted, and exit 1', () => {
     const r = runIn('name,amt\nb,2,EXTRA1,EXTRA2\na,1\nc,3,X\n', ['-c', 'amt', '-o', 'out.csv']);
-    assert.equal(r.status, 0, r.stderr);
+    assert.equal(r.status, 1, r.stderr);
+    assert.equal(fs.readFileSync(path.join(r.dir, 'out.csv'), 'utf8'), 'name,amt\na,1\nb,2\nc,3');
     assert.match(r.stderr, /^warning: 2 rows had more fields than the header \(first: data row 1\); the extra fields were dropped\.$/m);
 });
 
@@ -306,4 +306,56 @@ test('a header-only input writes a header-only output (replacing a stale one); a
     assert.equal(empty.status, 2);
     assert.match(empty.stderr, /^error: input has no header row/m);
     assert.deepEqual(empty.leftovers, []);
+});
+
+test('a mixed column has one order at every chunk size: empty, numbers (ZIP+4 with them), dates, times, then text', () => {
+    const values = ['N/A', '10', '9', '', 'abc', '2024-01-01', '5', '10:30', '2024-02-30', '2024-13-45', '10:75', '10001-1234', '08001', '9:99', '2024-01-01T25:00'];
+    const input = 'id,v\n' + values.map((v, i) => `r${i},${v}`).join('\n') + '\n';
+    for (const cs of ['1', '2', '7', undefined]) {
+        const r = runIn(input, ['-c', 'v', '-o', 'out.csv'], cs ? { SORT_LARGE_CSV_CHUNK_SIZE: cs } : {});
+        assert.equal(r.status, 0, r.stderr);
+        assert.deepEqual(dataRows(fs.readFileSync(path.join(r.dir, 'out.csv'), 'utf8')).map((l) => l.split(',')[1]),
+            ['', '5', '9', '10', '08001', '10001-1234', '2024-01-01', '10:30', '10:75', '2024-01-01T25:00', '2024-02-30', '2024-13-45', '9:99', 'abc', 'N/A'],
+            `chunk size ${cs || 'default'}`);
+    }
+});
+
+test('a ZIP column with ZIP+4 values sorts in ZIP order (an Excel-stripped 9020 with them)', () => {
+    const zips = ['30301', '10001-1234', '9020', '08001', '94105', '10001', '20001-0001', '10001-0001'];
+    for (const cs of ['1', '3', undefined]) {
+        const r = runIn('id,zip\n' + zips.map((z, i) => `r${i},${z}`).join('\n') + '\n', ['-c', 'zip', '-o', 'out.csv'], cs ? { SORT_LARGE_CSV_CHUNK_SIZE: cs } : {});
+        assert.equal(r.status, 0, r.stderr);
+        assert.deepEqual(dataRows(fs.readFileSync(path.join(r.dir, 'out.csv'), 'utf8')).map((l) => l.split(',')[1]),
+            ['08001', '9020', '10001', '10001-0001', '10001-1234', '20001-0001', '30301', '94105']);
+    }
+});
+
+test('--dedupe never merges rows that differ only in fields beyond the header; exit 1', () => {
+    const r = runIn('name,amt\na,1,KEEP-ME\na,1,OTHER\nb,2\na,1,KEEP-ME\na,1\n', ['-c', 'amt', '-d', '-D', 'o', '-o', 'out.csv']);
+    assert.equal(r.status, 1, r.stderr);
+    assert.match(r.stderr, /^warning: 3 rows had more fields than the header/m);
+    assert.match(r.stdout, /Removed 1 duplicate\.\n/);
+    assert.deepEqual(dataRows(fs.readFileSync(path.join(r.dir, 'o', 'out.csv'), 'utf8')), ['a,1', 'a,1', 'a,1', 'b,2']);
+    assert.equal(fs.readFileSync(path.join(r.dir, 'o', 'duplicates_log.csv'), 'utf8'), 'name,amt\na,1');
+});
+
+test('empty header cells are named by position (column_3, column_4), not refused', () => {
+    const r = runIn('Name,Amt,,\nb,2,x,\na,1,,y\n', ['-c', 'amt', '-o', 'out.csv']);
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(fs.readFileSync(path.join(r.dir, 'out.csv'), 'utf8'), 'name,amt,column_3,column_4\na,1,,y\nb,2,x,');
+});
+
+test('--split names an NFD value by its NFC form', () => {
+    const r = runIn('id,city\n1,Zu\u0308rich\n', ['-c', 'city', '--split', '-D', 's']);
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(fs.readdirSync(path.join(r.dir, 's')), ['output_z\u00fcrich.csv']);
+});
+
+test('--split: many tie revisits each wait for the earlier writer, so every row lands once and in order', () => {
+    const rows = Array.from({ length: 200 }, (_, i) => `r${i},${i % 2 ? '10.0' : '10'}`);
+    const r = runIn('id,v\n' + rows.join('\n') + '\n', ['-c', 'v', '--split', '-D', 's'], { SORT_LARGE_CSV_CHUNK_SIZE: '2' });
+    assert.equal(r.status, 0, r.stderr);
+    const read = (f) => fs.readFileSync(path.join(r.dir, 's', f), 'utf8');
+    assert.equal(read('output_10.csv'), 'id,v\n' + rows.filter((_, i) => i % 2 === 0).join('\n'));
+    assert.equal(read('output_10_0.csv'), 'id,v\n' + rows.filter((_, i) => i % 2).join('\n'));
 });

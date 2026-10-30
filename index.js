@@ -28,8 +28,8 @@ let TEMP_DIR = null;
 let activeBar = null;
 
 // --- EXIT CODES ---
-// 0 ok, 1 partial (ran to completion, some items failed), 2 usage, 3 could not
-// complete. This tool has no per-item failure condition, so it never exits 1.
+// 0 ok, 1 partial (ran to completion, some items failed: a row's fields beyond
+// the header were dropped), 2 usage, 3 could not complete.
 const EXIT = { OK: 0, PARTIAL: 1, USAGE: 2, FAILED: 3 };
 
 class UsageError extends Error {}
@@ -86,21 +86,33 @@ const compareRows = (a, b) => {
     const keyA = sortKey(valA);
     const keyB = sortKey(valB);
 
-    if (keyA && keyB && keyA.kind === keyB.kind) return keyA.n - keyB.n;
-    return valA.localeCompare(valB);
+    // Kinds sort in a fixed order, so a column that mixes them still has one
+    // total order (every chunk and the merge must agree, or the output
+    // depends on where the chunk boundaries fall).
+    if (keyA.kind !== keyB.kind) return KIND_RANK[keyA.kind] - KIND_RANK[keyB.kind];
+    if (keyA.kind === 'text') return valA.localeCompare(valB);
+    return keyA.n - keyB.n;
 };
 
-// A value compares numerically against another of the same kind: a whole
-// plain number (not "2024-03-01", which parseFloat reads as 2024), an ISO
-// date or date-time, or a clock time. Anything else returns null and sorts
-// as text.
+// Empty first, then numbers, dates, clock times, and text last. A number is a
+// whole plain number (not "2024-03-01", which parseFloat reads as 2024); a
+// ZIP+4 (10001-1234) sorts with the numbers, just after its 5-digit ZIP. A
+// date or time that doesn't exist (2024-02-30, 10:75) is text.
+const KIND_RANK = { empty: 0, number: 1, date: 2, time: 3, text: 4 };
 const NUMBER_RE = /^[-+]?(\d+\.?\d*|\.\d+)(e[-+]?\d+)?$/i;
+const ZIP4_RE = /^(\d{5})-(\d{4})$/;
 const ISO_DATE_RE = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(\.\d+)?)?)?\s*(Z|[+-]\d{2}:?\d{2})?$/i;
 const TIME_RE = /^(\d{1,2}):(\d{2})(?::(\d{2})(\.\d+)?)?\s*([AP]M)?$/i;
+const TEXT = { kind: 'text' };
 function sortKey(val) {
+    if (val === '') return { kind: 'empty', n: 0 };
     if (NUMBER_RE.test(val)) return { kind: 'number', n: parseFloat(val) };
-    let m = val.match(ISO_DATE_RE);
+    let m = val.match(ZIP4_RE);
+    if (m) return { kind: 'number', n: +m[1] + +m[2] / 10000 };
+    m = val.match(ISO_DATE_RE);
     if (m) {
+        const daysInMonth = new Date(Date.UTC(+m[1], +m[2], 0)).getUTCDate();
+        if (+m[2] < 1 || +m[2] > 12 || +m[3] < 1 || +m[3] > daysInMonth || +(m[4] || 0) > 23 || +(m[5] || 0) > 59 || +(m[6] || 0) > 59) return TEXT;
         let n = Date.UTC(+m[1], +m[2] - 1, +m[3], +(m[4] || 0), +(m[5] || 0), +(m[6] || 0)) + (m[7] ? parseFloat(m[7]) * 1000 : 0);
         if (m[8] && m[8].toUpperCase() !== 'Z') {
             const off = m[8].replace(':', '');
@@ -110,11 +122,12 @@ function sortKey(val) {
     }
     m = val.match(TIME_RE);
     if (m) {
+        if (+m[1] > (m[5] ? 12 : 23) || +m[2] > 59 || +(m[3] || 0) > 59) return TEXT;
         let h = +m[1];
         if (m[5]) h = (h % 12) + (m[5].toUpperCase() === 'PM' ? 12 : 0);
         return { kind: 'time', n: h * 3600 + +m[2] * 60 + +(m[3] || 0) + (m[4] ? parseFloat(m[4]) : 0) };
     }
-    return null;
+    return TEXT;
 }
 
 // Split file name for a value: letters (any script) and digits kept,
@@ -170,11 +183,13 @@ async function main() {
         }
 
         // 1. PHASE ONE: CHUNKING
-        const { chunkFiles, headers } = await createSortedChunks(argv.input);
+        const { chunkFiles, headers, extrasCol, raggedRows } = await createSortedChunks(argv.input);
         if (!headers) throw new UsageError(`input has no header row: ${argv.input}`);
 
         // 2. PHASE TWO: MERGING
-        await mergeChunks(chunkFiles, headers);
+        await mergeChunks(chunkFiles, headers, extrasCol);
+        // Fields beyond the header were dropped from the output: a lossy run.
+        if (raggedRows) process.exitCode = EXIT.PARTIAL;
 
         await cleanupTempDir();
         console.log('\nDone! Temporary files cleaned up.');
@@ -213,6 +228,10 @@ async function createSortedChunks(inputFile) {
     let chunkCount = 0;
     let chunkFiles = [];
     let headers = null;
+    // Chunk-file column holding a ragged row's fields beyond the header (as
+    // JSON), so --dedupe compares the whole row; never written to the output.
+    let extrasCol = null;
+    let chunkHeaders = null;
 
     return new Promise((resolve, reject) => {
         const stream = fs.createReadStream(inputFile);
@@ -226,7 +245,7 @@ async function createSortedChunks(inputFile) {
         // nowhere bounded to stop — on any input with more than one chunk,
         // that raced the array to unbounded growth and OOM'd.
         const parser = stream.pipe(csv({
-    		mapHeaders: ({ header }) => header.trim().toLowerCase()
+    		mapHeaders: ({ header, index }) => header.trim().toLowerCase() || `column_${index + 1}`
 }));
 
         // The chunk write in flight, if any. 'end' can fire while the last
@@ -258,13 +277,18 @@ async function createSortedChunks(inputFile) {
                 if (!h.includes(sortCol)) {
                     fail(`column not found: ${argv.column} (columns: ${h.join(', ')})`);
                 }
+                extrasCol = 'extra fields';
+                while (h.includes(extrasCol)) extrasCol += '_';
+                chunkHeaders = [...h, extrasCol];
             })
             .on('data', async (data) => {
                 try {
                     rowNumber++;
-                    if (Object.keys(data).length > headers.length) {
+                    const keys = Object.keys(data);
+                    if (keys.length > headers.length) {
                         if (!raggedRows) firstRagged = rowNumber;
                         raggedRows++;
+                        data[extrasCol] = JSON.stringify(keys.slice(headers.length).map((k) => data[k]));
                     }
                     rows.push(data);
                     if (rows.length >= CHUNK_SIZE) {
@@ -276,7 +300,7 @@ async function createSortedChunks(inputFile) {
                         parser.pause();
                         const full = rows;
                         rows = [];
-                        inFlight = writeChunk(full, chunkCount++, headers).then((chunkPath) => { chunkFiles.push(chunkPath); });
+                        inFlight = writeChunk(full, chunkCount++, chunkHeaders).then((chunkPath) => { chunkFiles.push(chunkPath); });
                         await inFlight;
                         inFlight = null;
                         parser.resume();
@@ -289,14 +313,14 @@ async function createSortedChunks(inputFile) {
                 try {
                     if (inFlight) await inFlight;
                     if (rows.length > 0) {
-                        const chunkPath = await writeChunk(rows, chunkCount++, headers);
+                        const chunkPath = await writeChunk(rows, chunkCount++, chunkHeaders);
                         chunkFiles.push(chunkPath);
                     }
                     bar.stop();
                     if (raggedRows) {
                         console.error(`warning: ${raggedRows} row${raggedRows === 1 ? '' : 's'} had more fields than the header (first: data row ${firstRagged}); the extra fields were dropped.`);
                     }
-                    resolve({ chunkFiles, headers });
+                    resolve({ chunkFiles, headers, extrasCol, raggedRows });
                 } catch (err) {
                     reject(err);
                 }
@@ -353,7 +377,7 @@ function readNextRow(stream) {
     });
 }
 
-async function mergeChunks(chunkFiles, headers) {
+async function mergeChunks(chunkFiles, headers, extrasCol) {
     console.log(`\nPhase 2: Merging ${chunkFiles.length} chunks...`);
     if (chunkFiles.length === 0) {
         // A header with no data rows: still write (and so replace) the
@@ -378,6 +402,8 @@ async function mergeChunks(chunkFiles, headers) {
     }));
 
     let activeHeads = streamHeads.filter(h => h !== null);
+    // A row as written to the output: without the chunk files' extras column.
+    const visible = (row) => { const { [extrasCol]: extras, ...rest } = row; return rest; };
 
     let currentWriter = null;
     let currentSplitVal = null;
@@ -445,7 +471,7 @@ async function mergeChunks(chunkFiles, headers) {
             if (seenRowKeys.has(rowKey)) {
                 isDuplicate = true;
                 dupeCount++;
-                dupeWriter.write(currentRow);
+                dupeWriter.write(visible(currentRow));
             } else {
                 seenRowKeys.add(rowKey);
             }
@@ -479,9 +505,9 @@ async function mergeChunks(chunkFiles, headers) {
                     currentWriter = fastCsv.format({ headers: true, writeHeaders: !revisit });
                     currentWriter.pipe(ws);
                 }
-                currentWriter.write(currentRow);
+                currentWriter.write(visible(currentRow));
             } else {
-                currentWriter.write(currentRow);
+                currentWriter.write(visible(currentRow));
             }
         }
 
@@ -503,7 +529,7 @@ async function mergeChunks(chunkFiles, headers) {
     if (outputError) throw outputError;
 
     if (argv.dedupe) {
-        console.log(`\nCompleted. Removed ${dupeCount} duplicates.`);
+        console.log(`\nCompleted. Removed ${dupeCount} duplicate${dupeCount === 1 ? '' : 's'}.`);
     }
 }
 

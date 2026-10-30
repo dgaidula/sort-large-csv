@@ -18,7 +18,15 @@ Breaking changes from 1.0.0:
 - Sorting: a value compares numerically only when the whole value is a plain
   number; ISO dates and date-times, and clock times, compare chronologically.
   1.0.0 used `parseFloat`, so every date in a year tied and `10:30` sorted
-  before `10:05`.
+  before `10:05`. In a column that mixes kinds, they sort empty, numbers,
+  dates, times, then text; a ZIP+4 sorts with the numbers, after its 5-digit
+  ZIP. A date or time that doesn’t exist (`2024-02-30`, `10:75`) is text.
+- A row with more fields than the header exits `1` (the extra fields are
+  still left out of the output, with a warning and a count); `--dedupe`
+  compares the whole row, extra fields included. 1.0.0 dropped them silently
+  and could merge two rows that differed only there.
+- Empty header cells are named by position (`column_3`); 1.0.0 merged them
+  into one column and kept only the last one’s values.
 - `--split` file names keep letters in any script (`output_東京.csv`,
   `output_zürich.csv`), and values that map to the same name get numbered
   names (`output_new_york_2.csv`). 1.0.0 truncated the earlier file and lost
@@ -32,8 +40,7 @@ Fixes:
 - A header-only input writes a header-only output (and an empty
   `duplicates_log.csv` with `--dedupe`), replacing any earlier output, and says
   it had 0 data rows. 1.0.0 wrote nothing and left the old files in place.
-- A row with more fields than the header is reported on stderr with a count
-  (the extra fields are still dropped).
+- `--dedupe` says “Removed 1 duplicate.” for one row (1.0.0: “1 duplicates”).
 - Output write failures (an unwritable directory, a full disk) exit `3`
   instead of surfacing after “Done!”.
 
