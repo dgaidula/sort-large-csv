@@ -396,9 +396,11 @@ async function mergeChunks(chunkFiles, headers, extrasCol) {
 
     const streams = chunkFiles.map(file => fs.createReadStream(file).pipe(csv({ mapHeaders: ({ header }) => header.trim().toLowerCase() })));
 
-    const streamHeads = await Promise.all(streams.map(async (stream) => {
+    // chunk: the chunk's index (chunkFiles is in input order), so a tie goes
+    // to the earlier chunk and the merge is as stable as the in-chunk sort.
+    const streamHeads = await Promise.all(streams.map(async (stream, chunk) => {
         const data = await readNextRow(stream);
-        return data === null ? null : { data, stream };
+        return data === null ? null : { data, stream, chunk };
     }));
 
     let activeHeads = streamHeads.filter(h => h !== null);
@@ -455,7 +457,7 @@ async function mergeChunks(chunkFiles, headers, extrasCol) {
 
     while (activeHeads.length > 0) {
         if (outputError) throw outputError;
-        activeHeads.sort((a, b) => compareRows(a.data, b.data));
+        activeHeads.sort((a, b) => compareRows(a.data, b.data) || a.chunk - b.chunk);
         const winner = activeHeads[0];
         const currentRow = winner.data;
 

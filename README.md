@@ -38,8 +38,8 @@ Sort comparison is type-aware. Each value is one kind, and the kinds always
 sort in this order: empty, numbers, ISO dates and date-times, clock times,
 then text. Two values of the same kind compare by value (text by a string
 locale compare), so a column that mixes kinds puts its values in the same
-order whatever the chunk size. (Rows whose sort values are equal are not kept
-in input order: their relative order can differ with the chunk size.)
+order whatever the chunk size. The sort is stable: rows whose sort values are
+equal keep their input order, at any chunk size.
 
 - **Numbers**: the whole value is a plain decimal number, optionally signed,
   with an optional exponent (`10`, `-3.5`, `.5`, `1e2`). `1,000`, `$5` and

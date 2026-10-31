@@ -320,6 +320,17 @@ test('a mixed column has one order at every chunk size: empty, numbers (ZIP+4 wi
     }
 });
 
+test('rows with equal sort values keep their input order at every chunk size (a stable sort)', () => {
+    const values = 'W E W W E W W E W W E W E E W'.split(' ');
+    const input = 'id,v\n' + values.map((v, i) => `r${i},${v}`).join('\n') + '\n';
+    const stable = values.map((v, i) => `r${i},${v}`).sort((a, b) => a.split(',')[1].localeCompare(b.split(',')[1]));
+    for (const cs of ['1', '2', '3', undefined]) {
+        const r = runIn(input, ['-c', 'v', '-o', 'out.csv'], cs ? { SORT_LARGE_CSV_CHUNK_SIZE: cs } : {});
+        assert.equal(r.status, 0, r.stderr);
+        assert.deepEqual(dataRows(fs.readFileSync(path.join(r.dir, 'out.csv'), 'utf8')), stable, `chunk size ${cs || 'default'}`);
+    }
+});
+
 test('a ZIP column with ZIP+4 values sorts in ZIP order (an Excel-stripped 9020 with them)', () => {
     const zips = ['30301', '10001-1234', '9020', '08001', '94105', '10001', '20001-0001', '10001-0001'];
     for (const cs of ['1', '3', undefined]) {

@@ -43,6 +43,8 @@ Fixes:
 - `--dedupe` says “Removed 1 duplicate.” for one row (1.0.0: “1 duplicates”).
 - Output write failures (an unwritable directory, a full disk) exit `3`
   instead of surfacing after “Done!”.
+- The sort is stable: rows with equal sort values keep their input order
+  (1.0.0’s merge ordered them differently at each chunk size).
 
 ## 1.0.0
 
