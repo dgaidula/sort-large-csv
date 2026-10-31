@@ -13,7 +13,7 @@ npx sort-large-csv --help
 
 Or install it: `npm i -g sort-large-csv`, then run `sort-large-csv ...`.
 
-**Hardened:** 2026-10-30 · 461a25d · gate CLOSED WITH FOLLOW-UPS
+**Hardened:** 2026-10-31 · 7469f35 · gate CLOSED WITH FOLLOW-UPS
 
 ## What it’s good for
 
