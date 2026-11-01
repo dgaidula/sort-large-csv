@@ -220,7 +220,7 @@ git tag -a v<version> -m "v<version>"
 git push --follow-tags
 ```
 
-(`--follow-tags` pushes only annotated tags, so the tag needs `-a`.) The tag starts the `publish` workflow (`.github/workflows/publish.yml`), which runs the tests and publishes to npm with provenance, with no token involved. It works once the package is linked to this repository under Trusted publisher on npmjs.com, and it stops if the tag does not match the version in `package.json`.
+(`--follow-tags` pushes only annotated tags, so the tag needs `-a`.) The tag starts the `publish` workflow (`.github/workflows/publish.yml`), which runs the tests and publishes to npm with provenance, with no token involved. It works once the package is linked to this repository under Trusted publisher on npmjs.com with **npm publish** ticked under Allowed actions (links made since September 2026 allow only `npm stage publish` unless it is ticked, and a link can’t be edited, only deleted and made again), and it stops if the tag does not match the version in `package.json`. The first publish must succeed within 48 hours of making the link, or the link expires. Known limits: any pushed `v*` tag whose version matches publishes, even one on a commit that isn’t on `main`, and the job has no time limit of its own.
 
 ## License
 
