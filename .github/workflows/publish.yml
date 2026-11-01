@@ -1,0 +1,49 @@
+name: publish
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      # Full history: the test suite compares against earlier commits with `git show`.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false
+
+      - name: Require npm 11.5.1 or newer (trusted publishing)
+        run: |
+          have="$(npm --version)"
+          need="11.5.1"
+          if [ "$(printf '%s\n' "$need" "$have" | sort -V | head -n1)" != "$need" ]; then
+            echo "npm $have is older than $need; trusted publishing needs $need or newer." >&2
+            exit 1
+          fi
+          echo "npm $have"
+
+      - name: Require the tag to match package.json
+        run: |
+          want="v$(node -p "require('./package.json').version")"
+          if [ "$GITHUB_REF_NAME" != "$want" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match package.json (expected $want)." >&2
+            exit 1
+          fi
+
+      - run: npm ci
+      - run: npm test
+
+      # Direct publish, as decided in D625. To stage each release for approval
+      # instead, change this line to `npm stage publish`.
+      - run: npm publish

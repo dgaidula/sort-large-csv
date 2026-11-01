@@ -211,6 +211,17 @@ that one removed row now reads `Removed 1 duplicate.` (1.0.0: “1 duplicates”
 
 Node 18+.
 
+## Releasing
+
+Bump `version` in `package.json`, add its entry to `CHANGELOG.md`, commit, then tag and push:
+
+```sh
+git tag -a v<version> -m "v<version>"
+git push --follow-tags
+```
+
+(`--follow-tags` pushes only annotated tags, so the tag needs `-a`.) The tag starts the `publish` workflow (`.github/workflows/publish.yml`), which runs the tests and publishes to npm with provenance, with no token involved. It works once the package is linked to this repository under Trusted publisher on npmjs.com, and it stops if the tag does not match the version in `package.json`.
+
 ## License
 
 MIT © Danniel T. Gaidula. See [LICENSE](./LICENSE).
